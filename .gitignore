@@ -1,7 +1,9 @@
 .venv/
+node_modules/
+.next/
+.env
 __pycache__/
 *.pyc
 data/intermediate/
 data/output/
-.env
 .ipynb_checkpoints/
