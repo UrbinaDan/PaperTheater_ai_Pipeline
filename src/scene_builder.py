@@ -1,42 +1,175 @@
+import re
 import numpy as np
 
-def parse_florence_boxes(florence_result):
-    """
-    Extract detection boxes from Florence post-processed output.
-    This may vary slightly by task output, so inspect your first run.
-    """
-    boxes = []
-    # Typical structure often contains bboxes + labels in a dict
-    for key, value in florence_result.items():
-        if isinstance(value, dict):
-            bboxes = value.get("bboxes", [])
-            labels = value.get("labels", [])
-            for bbox, label in zip(bboxes, labels):
-                boxes.append({"bbox": bbox, "label": label})
-    return boxes
+def canonicalize_label(label: str) -> str:
+    label = label.lower().strip()
 
-def object_depth_stats(depth_map, segmented_objects):
-    stats = {}
-    for obj in segmented_objects:
-        vals = depth_map[obj["mask"].astype(bool)]
-        if len(vals) == 0:
-            stats[obj["label"]] = {"median": 1.0, "min": 1.0, "max": 1.0}
-        else:
-            stats[id(obj)] = {
-                "median": float(np.median(vals)),
-                "min": float(np.min(vals)),
-                "max": float(np.max(vals)),
+    # normalize common Florence variants
+    if label in {"pagoda", "building", "temple"}:
+        return "temple"
+    if label in {"plants", "plant", "bush", "bushes", "foreground plants", "foreground plant", "tree"}:
+        return "foliage"
+    if label in {"mountain"}:
+        return "mountain"
+    if label in {"sky"}:
+        return "sky"
+    if label in {"bridge"}:
+        return "bridge"
+
+    return label
+
+
+def box_iou(box_a, box_b):
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+
+    inter_w = max(0, inter_x2 - inter_x1)
+    inter_h = max(0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+
+    union = area_a + area_b - inter_area
+    if union <= 0:
+        return 0.0
+    return inter_area / union
+
+
+def parse_florence_boxes(det_output, image_shape):
+    """
+    Parse Florence OPEN_VOCABULARY_DETECTION output and convert
+    loc tokens from 0-999 space into image pixel coordinates.
+    """
+    if not isinstance(det_output, dict) or len(det_output) == 0:
+        return []
+
+    h, w = image_shape[:2]
+
+    key = list(det_output.keys())[0]
+    text = det_output[key]
+
+    pattern = r'([^<>]+?)<loc_(\d+)><loc_(\d+)><loc_(\d+)><loc_(\d+)>'
+    matches = re.findall(pattern, text)
+
+    boxes = []
+    for raw_label, x1, y1, x2, y2 in matches:
+        label = raw_label.lower()
+
+        for bad in ["a ", "the ", ","]:
+            label = label.replace(bad, " ")
+
+        words = [w.strip() for w in label.split() if w.strip()]
+        label = words[-1] if len(words) > 0 else ""
+
+        if not label:
+            continue
+
+        label = canonicalize_label(label)
+
+        x1 = int(int(x1) / 999 * w)
+        y1 = int(int(y1) / 999 * h)
+        x2 = int(int(x2) / 999 * w)
+        y2 = int(int(y2) / 999 * h)
+
+        x1 = max(0, min(x1, w - 1))
+        y1 = max(0, min(y1, h - 1))
+        x2 = max(0, min(x2, w - 1))
+        y2 = max(0, min(y2, h - 1))
+
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        area = (x2 - x1) * (y2 - y1)
+        if area < 0.01 * (w * h):
+            continue
+
+        if (x2 - x1) > 0.95 * w and (y2 - y1) > 0.95 * h:
+            continue
+
+        boxes.append({
+            "label": label,
+            "bbox": [x1, y1, x2, y2]
+        })
+
+    return deduplicate_boxes(boxes)
+
+
+def deduplicate_boxes(boxes, iou_thresh=0.65):
+    """
+    Remove overlapping duplicate detections of the same semantic object.
+    """
+    kept = []
+
+    for box in boxes:
+        label = box["label"]
+        bbox = box["bbox"]
+
+        duplicate = False
+        for prev in kept:
+            if prev["label"] == label and box_iou(prev["bbox"], bbox) >= iou_thresh:
+                duplicate = True
+                break
+
+        if not duplicate:
+            kept.append(box)
+
+    return kept
+
+
+def merge_segmented_by_label(segmented):
+    """
+    Merge masks that share the same canonical label.
+    """
+    merged = {}
+
+    for obj in segmented:
+        label = canonicalize_label(obj["label"])
+        mask = obj["mask"].astype(np.uint8)
+
+        if label not in merged:
+            merged[label] = {
+                "label": label,
+                "bbox": obj["bbox"],
+                "mask": mask.copy(),
+                "score": obj.get("score", 1.0)
             }
-    return stats
+        else:
+            merged[label]["mask"] = np.maximum(merged[label]["mask"], mask)
+
+            x1, y1, x2, y2 = merged[label]["bbox"]
+            bx1, by1, bx2, by2 = obj["bbox"]
+            merged[label]["bbox"] = [
+                min(x1, bx1),
+                min(y1, by1),
+                max(x2, bx2),
+                max(y2, by2)
+            ]
+            merged[label]["score"] = max(merged[label]["score"], obj.get("score", 1.0))
+
+    return list(merged.values())
+
 
 def assign_layers(segmented_objects, depth_map, target_num_layers=6):
+    """
+    Assign each object to a layer based on median depth.
+    Darker = farther, brighter = nearer for your current map.
+    """
     items = []
+
     for idx, obj in enumerate(segmented_objects):
         vals = depth_map[obj["mask"].astype(bool)]
         med = float(np.median(vals)) if len(vals) else 1.0
         items.append((idx, med))
 
-    items.sort(key=lambda x: x[1])  # near to far
+    # far to near
+    items.sort(key=lambda x: x[1])
+
     assignments = {}
     n = max(len(items), 1)
 

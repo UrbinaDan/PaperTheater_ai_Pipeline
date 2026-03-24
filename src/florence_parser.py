@@ -2,14 +2,20 @@ import torch
 from transformers import AutoProcessor, AutoModelForCausalLM
 from PIL import Image
 
+
 class FlorenceParser:
     def __init__(self, model_name="microsoft/Florence-2-base"):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+
+        self.processor = AutoProcessor.from_pretrained(
+            model_name,
+            trust_remote_code=True
+        )
+
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             trust_remote_code=True,
-            torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
+            torch_dtype=torch.float32
         ).to(self.device)
 
     def run_task(self, image_pil, task_prompt):
@@ -17,7 +23,12 @@ class FlorenceParser:
             text=task_prompt,
             images=image_pil,
             return_tensors="pt"
-        ).to(self.device)
+        )
+
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        if "pixel_values" in inputs:
+            inputs["pixel_values"] = inputs["pixel_values"].float()
 
         generated_ids = self.model.generate(
             input_ids=inputs["input_ids"],
