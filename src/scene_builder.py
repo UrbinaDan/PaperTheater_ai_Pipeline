@@ -112,28 +112,106 @@ def parse_florence_boxes(det_output, image_shape):
 
     return deduplicate_boxes(boxes)
 
+def _box_area(bbox):
+    x1, y1, x2, y2 = bbox
+    return max(0, x2 - x1) * max(0, y2 - y1)
 
-def deduplicate_boxes(boxes, iou_thresh=0.65):
-    """
-    Remove overlapping duplicate detections of the same semantic object.
-    """
-    kept = []
 
+def _intersection_area(box_a, box_b):
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+
+    inter_w = max(0, inter_x2 - inter_x1)
+    inter_h = max(0, inter_y2 - inter_y1)
+    return inter_w * inter_h
+
+
+def _overlap_fraction_of_smaller(box_a, box_b):
+    """
+    How much of the smaller box is covered by the intersection?
+    Returns a value in [0, 1].
+    """
+    inter = _intersection_area(box_a, box_b)
+    area_a = _box_area(box_a)
+    area_b = _box_area(box_b)
+    smaller = min(area_a, area_b)
+
+    if smaller <= 0:
+        return 0.0
+
+    return inter / smaller
+
+
+def deduplicate_boxes(boxes, iou_thresh=0.60, contain_thresh=0.85):
+    """
+    Remove overlapping duplicate detections of the same canonical label.
+
+    A box is considered duplicate if either:
+    1. IoU with a kept box is high enough, OR
+    2. The intersection covers most of the smaller box
+       (useful for nested Florence duplicates)
+
+    Strategy:
+    - canonicalize labels
+    - group by label
+    - sort larger boxes first
+    - keep larger representative boxes
+    """
+    if not boxes:
+        return []
+
+    normalized = []
     for box in boxes:
-        label = box["label"]
-        bbox = box["bbox"]
+        normalized.append({
+            "label": canonicalize_label(box["label"]),
+            "bbox": box["bbox"]
+        })
 
-        duplicate = False
-        for prev in kept:
-            if prev["label"] == label and box_iou(prev["bbox"], bbox) >= iou_thresh:
-                duplicate = True
-                break
+    grouped = {}
+    for box in normalized:
+        grouped.setdefault(box["label"], []).append(box)
 
-        if not duplicate:
-            kept.append(box)
+    kept_all = []
 
-    return kept
+    for label, label_boxes in grouped.items():
+        label_boxes = sorted(
+            label_boxes,
+            key=lambda b: _box_area(b["bbox"]),
+            reverse=True
+        )
 
+        kept_for_label = []
+
+        for candidate in label_boxes:
+            candidate_bbox = candidate["bbox"]
+            is_duplicate = False
+
+            for kept in kept_for_label:
+                kept_bbox = kept["bbox"]
+
+                iou = box_iou(candidate_bbox, kept_bbox)
+                contain = _overlap_fraction_of_smaller(candidate_bbox, kept_bbox)
+
+                if iou >= iou_thresh or contain >= contain_thresh:
+                    is_duplicate = True
+                    break
+
+            if not is_duplicate:
+                kept_for_label.append(candidate)
+
+        kept_all.extend(kept_for_label)
+
+    kept_all = sorted(
+        kept_all,
+        key=lambda b: (b["label"], b["bbox"][1], b["bbox"][0])
+    )
+
+    return kept_all
 
 def merge_segmented_by_label(segmented):
     """
@@ -276,6 +354,25 @@ def summarize_layer_assignments(segmented_objects, layer_assignments, depth_map=
     rows = sorted(rows, key=lambda x: x["layer"])
     return rows
 
+def summarize_stable_objects(stable_objects):
+    """
+    Save-friendly summary of stable merged objects.
+    Raw masks are omitted from JSON.
+    """
+    rows = []
+    for obj in stable_objects:
+        rows.append({
+            "id": obj["id"],
+            "label": obj["label"],
+            "bbox": obj["bbox"],
+            "score": obj["score"],
+            "area": obj["area"],
+            "centroid": obj["centroid"],
+            "depth_mean": obj["depth_mean"],
+            "depth_median": obj["depth_median"],
+        })
+    return rows
+
 
 def save_debug_json(path, data):
     path = Path(path)
@@ -290,6 +387,7 @@ def save_scene_debug_bundle(
     parsed_boxes=None,
     segmented=None,
     merged_segmented=None,
+    stable_objects=None,
     layer_assignments=None,
     depth_map=None,
     extra_meta=None,
@@ -329,3 +427,57 @@ def save_scene_debug_bundle(
 
     if extra_meta is not None:
         save_debug_json(debug_dir / "00_meta.json", extra_meta)
+
+    if stable_objects is not None:
+        stable_summary = summarize_stable_objects(stable_objects)
+        save_debug_json(debug_dir / "06_stable_objects.json", stable_summary)
+
+def _mask_centroid(mask):
+    """
+    Compute centroid of a binary mask as [x, y].
+    Returns None if the mask is empty.
+    """
+    ys, xs = np.nonzero(mask.astype(bool))
+    if len(xs) == 0 or len(ys) == 0:
+        return None
+    return [float(xs.mean()), float(ys.mean())]
+
+
+def build_stable_merged_objects(merged_segmented, depth_map):
+    """
+    Convert merged segmented objects into a stable object list with:
+    - stable id
+    - label
+    - bbox
+    - mask
+    - score
+    - area
+    - centroid
+    - depth stats
+
+    This does not change masks or labels.
+    It just packages them into a more reusable structure.
+    """
+    stable_objects = []
+
+    for i, obj in enumerate(merged_segmented):
+        mask_bool = obj["mask"].astype(bool)
+        mask_area = int(mask_bool.sum())
+
+        depth_vals = depth_map[mask_bool]
+        depth_mean = float(np.mean(depth_vals)) if len(depth_vals) else None
+        depth_median = float(np.median(depth_vals)) if len(depth_vals) else None
+
+        stable_objects.append({
+            "id": f"obj_{i:03d}",
+            "label": str(obj["label"]),
+            "bbox": [int(v) for v in obj["bbox"]],
+            "mask": obj["mask"],
+            "score": float(obj.get("score", 1.0)),
+            "area": mask_area,
+            "centroid": _mask_centroid(obj["mask"]),
+            "depth_mean": depth_mean,
+            "depth_median": depth_median,
+        })
+
+    return stable_objects
