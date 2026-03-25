@@ -5,22 +5,31 @@ from pathlib import Path
 import numpy as np
 
 
+CANONICAL_MAP = {
+    # temple-like labels
+    "pagoda": "temple",
+    "building": "temple",
+    "temple": "temple",
+    "bridge": "temple",
+
+    # foliage-like labels
+    "plant": "foliage",
+    "plants": "foliage",
+    "bush": "foliage",
+    "bushes": "foliage",
+    "tree": "foliage",
+    "foreground plant": "foliage",
+    "foreground plants": "foliage",
+
+    # stable labels
+    "mountain": "mountain",
+    "sky": "sky",
+}
+
+
 def canonicalize_label(label: str) -> str:
     label = label.lower().strip()
-
-    # normalize common Florence variants
-    if label in {"pagoda", "building", "temple"}:
-        return "temple"
-    if label in {"plants", "plant", "bush", "bushes", "foreground plants", "foreground plant", "tree"}:
-        return "foliage"
-    if label in {"mountain"}:
-        return "mountain"
-    if label in {"sky"}:
-        return "sky"
-    if label in {"bridge"}:
-        return "bridge"
-
-    return label
+    return CANONICAL_MAP.get(label, label)
 
 
 def box_iou(box_a, box_b):
