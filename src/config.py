@@ -3,7 +3,7 @@ from pathlib import Path
 
 @dataclass
 class Paths:
-    root: Path = Path("/content/paper-theater-ai")
+    root: Path = Path("/content/PaperTheater_ai_Pipeline")
     input_dir: Path = root / "data" / "input"
     inter_dir: Path = root / "data" / "intermediate"
     output_dir: Path = root / "data" / "output"
