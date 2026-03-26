@@ -481,3 +481,12 @@ def build_stable_merged_objects(merged_segmented, depth_map):
         })
 
     return stable_objects
+
+def get_stable_object_by_id(stable_objects, object_id):
+    """
+    Return one stable object by id, or None if not found.
+    """
+    for obj in stable_objects:
+        if obj["id"] == object_id:
+            return obj
+    return None
