@@ -47,6 +47,8 @@ Rules:
 5. Layers must go from farthest/background to nearest/foreground.
 6. Prefer sensible paper-theater grouping.
 7. Use readable layer names.
+8. The generated mountain must stay aligned with the input mask position and shape.
+9. Do not recenter or resize the mountain composition.
 """
     return prompt.strip()
 
