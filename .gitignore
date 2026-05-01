@@ -4,6 +4,4 @@ node_modules/
 .env
 __pycache__/
 *.pyc
-data/intermediate/
-data/output/
 .ipynb_checkpoints/
